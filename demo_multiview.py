@@ -14,7 +14,7 @@ from focal_loss import FocalLoss
 ### Setting arguments
 args = SimpleNamespace(epochs=6,
                        batch_size=1,
-                       lr=1e-4,
+                       lr=3e-4,
                        weight_decay=5e-4,
                        input_dim=448,
                        pretrained_weights="pretrained/vgg16_20M.pth",

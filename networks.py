@@ -137,7 +137,6 @@ class VGG16(nn.Module):
 
         for index,data in enumerate(dataloader):
 
-
             img = data[1]
             label = data[2]
 
@@ -223,6 +222,44 @@ class VGG16(nn.Module):
 
 
            return conf_matrix
+
+    def evaluate(self,dataloader):
+
+
+        self.eval()
+
+        conf_matrix = np.zeros((18, 18))
+        with torch.no_grad():
+
+            for index, data in enumerate(dataloader):
+
+                img_meta = data[0]
+                img = data[1]
+                label = data[2]
+                x = self(img)
+
+                preds = torch.argmax(x, 1).data.cpu().numpy()
+                labels = label.data.cpu().numpy()
+
+                ## all input image have identical width and height
+                X_min = img_meta["window"][0][0].data.cpu().numpy()
+                X_max =  img_meta["window"][0][1].data.cpu().numpy()
+                Y_min = img_meta["window"][0][2].data.cpu().numpy()
+                Y_max =  img_meta["window"][0][3].data.cpu().numpy()
+
+                X = img_meta['shape'][0][0].data.cpu().numpy()
+                Y = img_meta['shape'][0][1].data.cpu().numpy()
+
+                ## extracting CAM explainability cues
+                img_cam = img[:,:,X_min:X_max,Y_min:Y_max]
+                x = self.cam_output(img_cam)
+                x = F.upsample(x, [X, Y], mode='bilinear', align_corners=False)
+
+                for p_index in range(preds.shape[0]):
+                    conf_matrix[labels[p_index], preds[p_index]] += 1
+
+
+        return conf_matrix
 
 
     def extract_cams(self, dataloader, low_a=4, high_a=16):
@@ -601,6 +638,8 @@ class VGG16_multiview(VGG16):
 
 
            return conf_matrix
+
+
 
 
     def extract_cams(self, dataloader, low_a=4, high_a=16):

@@ -133,13 +133,16 @@ def pad_resize(img,desired_size):
     old_size = img.shape[:2]
     ratio = float(desired_size) / max(old_size)
     new_size = tuple([int(x * ratio) for x in old_size])
-    img = resize(img, new_size)
+    img = resize(img, new_size, preserve_range=True)
 
     new_im = np.zeros((desired_size,desired_size,3))
     new_im[int((desired_size - new_size[0]) // 2):(int((desired_size - new_size[0]) // 2)+img.shape[0]),
     int((desired_size - new_size[1]) // 2):(int((desired_size - new_size[1]) // 2)+img.shape[1]),:] = img
 
-    return new_im
+    img_window = [int((desired_size - new_size[0]) // 2),(int((desired_size - new_size[0]) // 2)+img.shape[0]),
+                  int((desired_size - new_size[1]) // 2), (int((desired_size - new_size[1]) // 2)+img.shape[1])]
+
+    return new_im, img_window
 
 class MMTDataset_baseline(Dataset):
 
@@ -162,9 +165,12 @@ class MMTDataset_baseline(Dataset):
     def __getitem__(self, idx):
         current_path = self.img_paths[idx]
 
-        img = plt.imread(current_path)
-        img = pad_resize(img, self.input_dim)
+        img_orig = plt.imread(current_path)
+        img, window = pad_resize(img_orig, self.input_dim)
+
+        ## removing the depicted meta data
         img[:120, :, :] = 0
+        window[0] = 120
 
         img_mean = np.mean(img, 2)
 
@@ -181,7 +187,29 @@ class MMTDataset_baseline(Dataset):
 
         label = torch.from_numpy(np.ndarray.astype(np.asarray(self.labels_dict["/".join(current_path.split("/")[2:])]), np.int64)).cuda()
 
-        return current_path, img, label
+        ## checking if frame annotated
+        bbox =[]
+        if "annotated" in current_path:
+            current_path_txt = current_path[:-3]+"txt"
+
+            with open(current_path_txt) as f:
+                bbox = f.readlines()
+
+            if len(bbox) > 0:
+                bbox = [" ".join(b.split(" ")[1:])[:-1].split(" ") for b in bbox]
+
+
+
+
+        ## constructing img meta data
+        img_meta = {
+            "path": current_path,
+            "shape": img_orig.shape[:2],
+            "window": window,
+            "bbox": bbox
+        }
+
+        return img_meta, img, label
 
 class MMTDataset_multiview(MMTDataset_baseline):
 
