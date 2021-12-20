@@ -8,7 +8,7 @@ from utils import *
 import torch.nn as nn
 import pandas as pd
 # from models.modeling import VisionTransformer, CONFIGS
-from networks import VGG16, VGG16_multiview
+from networks import  VGG16_multiview
 from focal_loss import FocalLoss
 
 ### Setting arguments
@@ -23,12 +23,12 @@ args = SimpleNamespace(epochs=6,
                        val_set="val_multiview.txt",
                        test_set="test_multiview.txt",
                        labels_dict="class_dict.npy",
-                       fl=False,
+                       fl=True,
                        frozen_stages = [1],  ## freezing the very generic early convolutional layers
 )
 
 # #### Stage 1
-args.session_name = "multiview/"
+args.session_name = "multiview_fl/"
 #
 
 
@@ -38,11 +38,11 @@ train_loader = DataLoader(train_loader, batch_size=args.batch_size, shuffle=True
 
 ## Constructing the validation loader
 val_loader = MMTDataset_multiview(args.val_set, args.labels_dict, args.img_folder, args.input_dim)
-val_loader = DataLoader(val_loader, batch_size=args.batch_size, shuffle=False)
+val_loader = DataLoader(val_loader, batch_size=args.batch_size, shuffle=True)
 
 ## Constructing the test loader
 test_loader = MMTDataset_multiview(args.test_set, args.labels_dict, args.img_folder, args.input_dim)
-test_loader = DataLoader(test_loader, batch_size=args.batch_size, shuffle=False)
+test_loader = DataLoader(test_loader, batch_size=args.batch_size, shuffle=True)
 
 ## Initializing the model
 model = VGG16_multiview(n_classes=18).cuda()
@@ -102,15 +102,34 @@ model.load_pretrained(model.session_name+"stage_1.pth")
 
 model.cuda()
 
-#
-#
-#
-#
-# print("testing epoch...")
-# model.epoch = 0
-# model.epochs = 0
-#
-# conf_matrix = model.val_epoch(test_loader, criterion)
-# df = pd.DataFrame(conf_matrix)
-# filepath = 'test_conf_matrix.xlsx'
-# df.to_excel(filepath, index=False)
+print("testing epoch...")
+model.epoch = 0
+model.epochs = 0
+
+conf_matrix_test, mIoU_test = model.evaluate(test_loader)
+metrics_test = compute_metrics(conf_matrix_test)
+
+metrics_test = np.hstack([metrics_test, mIoU_test[:, np.newaxis]])
+
+df = pd.DataFrame(metrics_test)
+filepath = args.session_name + 'test_metrics.xlsx'
+df.to_excel(filepath, index=False)
+
+df = pd.DataFrame(conf_matrix_test)
+filepath = args.session_name + 'test_conf_matrix.xlsx'
+df.to_excel(filepath, index=False)
+
+
+conf_matrix_val, mIoU_val = model.evaluate(val_loader)
+metrics_val = compute_metrics(conf_matrix_val)
+
+metrics_val = np.hstack([metrics_val, mIoU_val[:, np.newaxis]])
+
+
+df = pd.DataFrame(metrics_val)
+filepath = args.session_name + 'val_metrics.xlsx'
+df.to_excel(filepath, index=False)
+
+df = pd.DataFrame(conf_matrix_val)
+filepath = args.session_name + 'val_conf_matrix.xlsx'
+df.to_excel(filepath, index=False)

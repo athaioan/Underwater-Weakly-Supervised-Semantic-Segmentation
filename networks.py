@@ -4,6 +4,10 @@ import numpy as np
 import torch.nn.functional as F
 import os
 import matplotlib.pyplot as plt
+import numpy as np
+from skimage.measure import label as measure_segments
+from scipy import ndimage
+from utils import *
 
 class VGG16(nn.Module):
     def __init__(self, n_classes, fc6_dilation=1):
@@ -137,8 +141,9 @@ class VGG16(nn.Module):
 
         for index,data in enumerate(dataloader):
 
-            img = data[1]
-            label = data[2]
+
+            img = data[2]
+            label = data[3]
 
             x =  self(img)
 
@@ -185,8 +190,9 @@ class VGG16(nn.Module):
 
                for index, data in enumerate(dataloader):
 
-                   img = data[1]
-                   label = data[2]
+
+                   img = data[2]
+                   label = data[3]
 
                    x = self(img)
                    loss =criterion(x, label)
@@ -228,225 +234,85 @@ class VGG16(nn.Module):
 
         self.eval()
 
-        conf_matrix = np.zeros((18, 18))
+        conf_matrix = np.zeros((self.n_classes, self.n_classes))
+
+        hist = np.zeros((self.n_classes, self.n_classes))
+
         with torch.no_grad():
+
+
 
             for index, data in enumerate(dataloader):
 
-                img_meta = data[0]
-                img = data[1]
-                label = data[2]
+
+                img_meta = data[0][0] # img_meta identical for all samples
+                gt_mask = data[1]
+                img = data[2]
+                label = data[3]
                 x = self(img)
 
                 preds = torch.argmax(x, 1).data.cpu().numpy()
-                labels = label.data.cpu().numpy()
+
 
                 ## all input image have identical width and height
                 X_min = img_meta["window"][0][0].data.cpu().numpy()
-                X_max =  img_meta["window"][0][1].data.cpu().numpy()
-                Y_min = img_meta["window"][0][2].data.cpu().numpy()
-                Y_max =  img_meta["window"][0][3].data.cpu().numpy()
+                X_max =  img_meta["window"][1][0].data.cpu().numpy()
+                Y_min = img_meta["window"][2][0].data.cpu().numpy()
+                Y_max =  img_meta["window"][3][0].data.cpu().numpy()
 
                 X = img_meta['shape'][0][0].data.cpu().numpy()
-                Y = img_meta['shape'][0][1].data.cpu().numpy()
+                Y = img_meta['shape'][1][0].data.cpu().numpy()
 
                 ## extracting CAM explainability cues
                 img_cam = img[:,:,X_min:X_max,Y_min:Y_max]
                 x = self.cam_output(img_cam)
                 x = F.upsample(x, [X, Y], mode='bilinear', align_corners=False)
 
+                # resizing label to (batch , 1, 240, 320)
+                label_idx = label.view(-1, 1, 1, 1).repeat((1, 1) + x.size()[-2:])
+
+                cams = torch.gather(x, 1, label_idx).squeeze()
+
+                normalizer = torch.amax(cams, (1, 2))
+                normalizer += (normalizer == 0)*1 ## avoid dividing by zero
+                cams = cams / normalizer.view(-1,1,1)
+
+                ## thresholding cams
+                cams = cams*label.view(-1, 1, 1)
+
+                ## insterting
+                for current_index in range(cams.shape[0]):
+                    current_label = label[current_index].data.cpu().numpy()
+                    if current_label>0:
+                        current_cam = cams[current_index].data.cpu().numpy()
+                        current_cam = (current_cam > 0.4)
+
+                        current_gt_mask = gt_mask[current_index].data.cpu().numpy()
+                        current_pred_mask = np.zeros_like(current_gt_mask)
+
+                        label_im, nb_labels = ndimage.label(current_cam)
+                        if nb_labels > 0:
+                            ## catching the case of full zero cams
+                            ## extracting bboxes
+                            masks = [label_im==(i+1) for i in range(nb_labels)]
+                            masks = np.asarray(masks).transpose(1,2,0)
+                            bboxes = extract_bboxes(masks)
+                            for i in range(nb_labels):
+                                current_bbox = bboxes[i,:]
+                                current_pred_mask[current_bbox[0]:current_bbox[2],
+                                current_bbox[1]:current_bbox[3]] = current_label
+
+                            hist = score_hist(hist, current_gt_mask, current_pred_mask, self.n_classes)
+
+                labels = label.data.cpu().numpy()
                 for p_index in range(preds.shape[0]):
                     conf_matrix[labels[p_index], preds[p_index]] += 1
 
+                print('Step: {}/{}\n'.format(index + 1, len(dataloader)))
+            mIoU = compute_mIOU(hist,self.n_classes)
 
-        return conf_matrix
+        return conf_matrix, mIoU
 
-
-    def extract_cams(self, dataloader, low_a=4, high_a=16):
-
-        if not os.path.exists(cam_folder):
-            os.makedirs(cam_folder)
-
-
-        with torch.no_grad():
-            for index, data in enumerate(dataloader):
-                print(str(index)+" / " + str(len(dataloader)))
-                #current_path, imgs, label, windows, orginal_shape, original_img
-                original_shape = data[4]
-                label = data[2]
-
-                imgs = data[1]
-                windows = data[3]
-                img_original = data[5][0].data.cpu().numpy()
-
-                final_cam = np.zeros([self.n_classes, original_shape[0], original_shape[1]])
-                final_cam_unlabeled = np.zeros([self.n_classes, original_shape[0], original_shape[1]])
-
-                for index, img in enumerate(imgs):
-
-                    window = windows[index]
-
-
-                    x = self.cam_output(img)
-
-
-                    x = F.upsample(x, [img.shape[2], img.shape[3]], mode='bilinear', align_corners=False)[0]
-
-                    ## removing the crop window
-                    x = x[:, window[0]:window[2], window[1]:window[3]]
-
-                    x = F.upsample(x.unsqueeze(0), [original_shape[0].data.cpu().numpy()[0], original_shape[1].data.cpu().numpy()[0]], mode='bilinear', align_corners=False)[0]
-
-                    ## filter out non-existing classes
-                    cam = x.cpu().numpy() * label.clone().view(self.n_classes, 1, 1).data.cpu().numpy()
-                    cam_unlabeled = x.cpu().numpy()
-
-                    if index % 2 == 1:
-                        cam = np.flip(cam, axis=2)
-                        cam_unlabeled = np.flip(cam_unlabeled, axis=2)
-
-                    final_cam += cam
-                    final_cam_unlabeled += cam_unlabeled
-
-                ## normalizing final_cam
-                denom = np.max(final_cam, (1, 2))
-                denom_unlabeled = np.max(final_cam_unlabeled, (1, 2))
-
-                ## when class does not exist then divide by one
-                denom += 1 - (denom > 0)
-                denom_unlabeled += 1 - (denom_unlabeled > 0)
-
-                final_cam /= denom.reshape(self.n_classes, 1, 1)
-
-                ########## savings cams as dict
-                final_cam_dict = {}
-                final_cam_dict_unlabeled = {}
-
-                for i in range(self.n_classes):
-                    final_cam_dict_unlabeled[i] = final_cam_unlabeled[i]
-                    if label[0][i] == 1:
-                        final_cam_dict[i] = final_cam[i]
-
-
-
-                existing_cams = np.asarray(list(final_cam_dict.values()))
-                existing_cams_unlabeled = np.asarray(list(final_cam_dict_unlabeled.values()))
-
-                bg_score_low = np.power(1 - np.max(existing_cams, axis=0), low_a)
-                bg_score_high = np.power(1 - np.max(existing_cams, axis=0), high_a)
-
-                bg_score_low_cams = np.concatenate((np.expand_dims(bg_score_low, 0), existing_cams), axis=0)
-                bg_score_high_cams = np.concatenate((np.expand_dims(bg_score_high, 0), existing_cams), axis=0)
-
-                crf_score_low = crf_inference(img_original, bg_score_low_cams, labels=bg_score_low_cams.shape[0])
-                crf_score_high = crf_inference(img_original, bg_score_high_cams, labels=bg_score_high_cams.shape[0])
-
-                crf_low_dict = {}
-                crf_high_dict = {}
-
-                crf_low_dict[0] = crf_score_low[0]
-                crf_high_dict[0] = crf_score_high[0]
-
-                for i, key in enumerate(final_cam_dict.keys()):
-                    # plus one to account for the added BG class
-                    crf_low_dict[key+1] = crf_score_low[i+1]
-                    crf_high_dict[key+1] = crf_score_high[i+1]
-
-                if not os.path.exists(cam_folder+"low"):
-                    os.makedirs(cam_folder+"low")
-
-                if not os.path.exists(cam_folder+"high"):
-                    os.makedirs(cam_folder+"high")
-
-                if not os.path.exists(cam_folder + "default"):
-                    os.makedirs(cam_folder + "default")
-
-
-                np.save(cam_folder+"low/"+data[0][0].split("/")[-1][:-4]+".npy", crf_low_dict)
-                np.save(cam_folder+"high/"+data[0][0].split("/")[-1][:-4]+".npy", crf_high_dict)
-                np.save(cam_folder+"default/"+data[0][0].split("/")[-1][:-4]+".npy", existing_cams_unlabeled)
-
-    def evaluate_cams(self,dataloader, cam_folder, gt_mask_folder):
-
-        t_hold = 0.2
-        c_num = np.zeros(21)
-        c_denom = np.zeros(21)
-        gt_masks = []
-        preds = []
-
-
-        for index, data in enumerate(dataloader):
-
-            img = data[1]
-            label = data[2]
-
-            img_key = data[0][0].split("/")[-1].split(".")[0]
-            # I = plt.imread("C:/Users/johny/Desktop/ProjectV2/VOCdevkit/VOC2012/JPEGImages/"+img_key+".jpg")
-            ## loading generated cam
-            # cam_low = np.load(cam_folder +"low/" + img_key + '.npy').item()
-            cam_default = np.load(cam_folder +"default/" + img_key + '.npy')
-            # cam_high = np.load(cam_folder +"high/" + img_key + '.npy').item()
-
-            ## considering only the labeled cams
-            cam_default = cam_default * label.clone().view(self.n_classes, 1, 1).data.cpu().numpy()
-
-            ## normalizing final_cam
-            denom = np.max(cam_default, (1, 2))
-
-            ## when class does not exist then divide by one
-            denom += 1 - (denom > 0)
-
-            cam_default /= denom.reshape(self.n_classes, 1, 1)
-
-
-            bg_score = np.expand_dims(np.ones_like(cam_default[0])*t_hold,0)
-            pred = np.argmax(np.concatenate((bg_score, cam_default)), 0)
-
-
-
-            ## loading ground truth annotated mask
-            gt_mask = Image.open(gt_mask_folder + img_key + '.png')
-            gt_mask = np.array(gt_mask)
-
-            preds.append(pred)
-            gt_masks.append(gt_mask)
-
-
-        sc = scores(gt_masks, preds, self.n_classes+1)
-
-        return sc
-
-    def extract_sub_category(self,dataloader,sub_folder):
-
-        features={}
-        ids = {}
-
-        if not os.path.exists(sub_folder):
-            os.makedirs(sub_folder)
-
-
-        for i in range(20):
-            features[i] = []
-            ids[i] =[]
-
-        with torch.no_grad():
-            for index, data in enumerate(dataloader):
-
-                img = data[1]
-                key = data[0][0].split("/")[-1].split(".")[0]
-                label = data[2].data.cpu().numpy()
-                x = self.feature_extractor(img)
-                feat = F.avg_pool2d(x, kernel_size=(x.size(2), x.size(3)), padding=0).squeeze().data.cpu().numpy()
-                feat /= np.linalg.norm(feat)
-
-                id = np.where(label[0])[0]
-
-                for i in id:
-                    ids[i].append(key)
-                    features[i].append(feat)
-
-            np.save(sub_folder+"features.npy", features)
-            np.save(sub_folder+"ids.npy", ids)
 
     def visualize_graph(self):
 
@@ -526,9 +392,7 @@ class VGG16_multiview(VGG16):
         x2 = F.avg_pool2d(x2, kernel_size=(x2.size(2), x2.size(3)), padding=0)
         x2 = x2.view(-1, self.n_classes)
 
-        return x1,x2
-
-
+        return x1, x2
 
     def train_epoch(self, dataloader, optimizer, criterion, verbose=True):
 
@@ -538,9 +402,10 @@ class VGG16_multiview(VGG16):
 
         for index,data in enumerate(dataloader):
 
-            imgs = data[0]
-            labels = data[1]
-            triplet_label = data[2]
+
+            imgs = data[2]
+            labels = data[3]
+            triplet_label = data[4]
 
             [batch,m,c,M,N] = imgs.size()
 
@@ -583,8 +448,6 @@ class VGG16_multiview(VGG16):
 
         return
 
-
-
     def val_epoch(self, dataloader,criterion, verbose=True):
 
            val_loss = 0
@@ -596,8 +459,8 @@ class VGG16_multiview(VGG16):
 
                for index, data in enumerate(dataloader):
 
-                   imgs = data[0]
-                   labels = data[1]
+                   imgs = data[2]
+                   labels = data[3]
 
                    [batch, m, c, M, N] = imgs.size()
 
@@ -639,197 +502,90 @@ class VGG16_multiview(VGG16):
 
            return conf_matrix
 
+    def evaluate(self, dataloader):
 
+        self.eval()
 
+        conf_matrix = np.zeros((self.n_classes, self.n_classes))
 
-    def extract_cams(self, dataloader, low_a=4, high_a=16):
-
-        if not os.path.exists(cam_folder):
-            os.makedirs(cam_folder)
-
+        hist = np.zeros((self.n_classes, self.n_classes))
 
         with torch.no_grad():
-            for index, data in enumerate(dataloader):
-                print(str(index)+" / " + str(len(dataloader)))
-                #current_path, imgs, label, windows, orginal_shape, original_img
-                original_shape = data[4]
-                label = data[2]
 
-                imgs = data[1]
-                windows = data[3]
-                img_original = data[5][0].data.cpu().numpy()
-
-                final_cam = np.zeros([self.n_classes, original_shape[0], original_shape[1]])
-                final_cam_unlabeled = np.zeros([self.n_classes, original_shape[0], original_shape[1]])
-
-                for index, img in enumerate(imgs):
-
-                    window = windows[index]
-
-
-                    x = self.cam_output(img)
-
-
-                    x = F.upsample(x, [img.shape[2], img.shape[3]], mode='bilinear', align_corners=False)[0]
-
-                    ## removing the crop window
-                    x = x[:, window[0]:window[2], window[1]:window[3]]
-
-                    x = F.upsample(x.unsqueeze(0), [original_shape[0].data.cpu().numpy()[0], original_shape[1].data.cpu().numpy()[0]], mode='bilinear', align_corners=False)[0]
-
-                    ## filter out non-existing classes
-                    cam = x.cpu().numpy() * label.clone().view(self.n_classes, 1, 1).data.cpu().numpy()
-                    cam_unlabeled = x.cpu().numpy()
-
-                    if index % 2 == 1:
-                        cam = np.flip(cam, axis=2)
-                        cam_unlabeled = np.flip(cam_unlabeled, axis=2)
-
-                    final_cam += cam
-                    final_cam_unlabeled += cam_unlabeled
-
-                ## normalizing final_cam
-                denom = np.max(final_cam, (1, 2))
-                denom_unlabeled = np.max(final_cam_unlabeled, (1, 2))
-
-                ## when class does not exist then divide by one
-                denom += 1 - (denom > 0)
-                denom_unlabeled += 1 - (denom_unlabeled > 0)
-
-                final_cam /= denom.reshape(self.n_classes, 1, 1)
-
-                ########## savings cams as dict
-                final_cam_dict = {}
-                final_cam_dict_unlabeled = {}
-
-                for i in range(self.n_classes):
-                    final_cam_dict_unlabeled[i] = final_cam_unlabeled[i]
-                    if label[0][i] == 1:
-                        final_cam_dict[i] = final_cam[i]
-
-
-
-                existing_cams = np.asarray(list(final_cam_dict.values()))
-                existing_cams_unlabeled = np.asarray(list(final_cam_dict_unlabeled.values()))
-
-                bg_score_low = np.power(1 - np.max(existing_cams, axis=0), low_a)
-                bg_score_high = np.power(1 - np.max(existing_cams, axis=0), high_a)
-
-                bg_score_low_cams = np.concatenate((np.expand_dims(bg_score_low, 0), existing_cams), axis=0)
-                bg_score_high_cams = np.concatenate((np.expand_dims(bg_score_high, 0), existing_cams), axis=0)
-
-                crf_score_low = crf_inference(img_original, bg_score_low_cams, labels=bg_score_low_cams.shape[0])
-                crf_score_high = crf_inference(img_original, bg_score_high_cams, labels=bg_score_high_cams.shape[0])
-
-                crf_low_dict = {}
-                crf_high_dict = {}
-
-                crf_low_dict[0] = crf_score_low[0]
-                crf_high_dict[0] = crf_score_high[0]
-
-                for i, key in enumerate(final_cam_dict.keys()):
-                    # plus one to account for the added BG class
-                    crf_low_dict[key+1] = crf_score_low[i+1]
-                    crf_high_dict[key+1] = crf_score_high[i+1]
-
-                if not os.path.exists(cam_folder+"low"):
-                    os.makedirs(cam_folder+"low")
-
-                if not os.path.exists(cam_folder+"high"):
-                    os.makedirs(cam_folder+"high")
-
-                if not os.path.exists(cam_folder + "default"):
-                    os.makedirs(cam_folder + "default")
-
-
-                np.save(cam_folder+"low/"+data[0][0].split("/")[-1][:-4]+".npy", crf_low_dict)
-                np.save(cam_folder+"high/"+data[0][0].split("/")[-1][:-4]+".npy", crf_high_dict)
-                np.save(cam_folder+"default/"+data[0][0].split("/")[-1][:-4]+".npy", existing_cams_unlabeled)
-
-
-
-    def evaluate_cams(self,dataloader, cam_folder, gt_mask_folder):
-
-        t_hold = 0.2
-        c_num = np.zeros(21)
-        c_denom = np.zeros(21)
-        gt_masks = []
-        preds = []
-
-
-        for index, data in enumerate(dataloader):
-
-            img = data[1]
-            label = data[2]
-
-            img_key = data[0][0].split("/")[-1].split(".")[0]
-            # I = plt.imread("C:/Users/johny/Desktop/ProjectV2/VOCdevkit/VOC2012/JPEGImages/"+img_key+".jpg")
-            ## loading generated cam
-            # cam_low = np.load(cam_folder +"low/" + img_key + '.npy').item()
-            cam_default = np.load(cam_folder +"default/" + img_key + '.npy')
-            # cam_high = np.load(cam_folder +"high/" + img_key + '.npy').item()
-
-            ## considering only the labeled cams
-            cam_default = cam_default * label.clone().view(self.n_classes, 1, 1).data.cpu().numpy()
-
-            ## normalizing final_cam
-            denom = np.max(cam_default, (1, 2))
-
-            ## when class does not exist then divide by one
-            denom += 1 - (denom > 0)
-
-            cam_default /= denom.reshape(self.n_classes, 1, 1)
-
-
-            bg_score = np.expand_dims(np.ones_like(cam_default[0])*t_hold,0)
-            pred = np.argmax(np.concatenate((bg_score, cam_default)), 0)
-
-
-
-            ## loading ground truth annotated mask
-            gt_mask = Image.open(gt_mask_folder + img_key + '.png')
-            gt_mask = np.array(gt_mask)
-
-            preds.append(pred)
-            gt_masks.append(gt_mask)
-
-
-        sc = scores(gt_masks, preds, self.n_classes+1)
-
-        return sc
-
-    def extract_sub_category(self,dataloader,sub_folder):
-
-        features={}
-        ids = {}
-
-        if not os.path.exists(sub_folder):
-            os.makedirs(sub_folder)
-
-
-        for i in range(20):
-            features[i] = []
-            ids[i] =[]
-
-        with torch.no_grad():
             for index, data in enumerate(dataloader):
 
-                img = data[1]
-                key = data[0][0].split("/")[-1].split(".")[0]
-                label = data[2].data.cpu().numpy()
-                x = self.feature_extractor(img)
-                feat = F.avg_pool2d(x, kernel_size=(x.size(2), x.size(3)), padding=0).squeeze().data.cpu().numpy()
-                feat /= np.linalg.norm(feat)
 
-                id = np.where(label[0])[0]
+                img_meta = data[0][0]  # img_meta identical for all samples
+                gt_mask = data[1]
+                imgs = data[2]
+                labels = data[3]
 
-                for i in id:
-                    ids[i].append(key)
-                    features[i].append(feat)
+                [batch, m, c, M, N] = imgs.size()
 
-            np.save(sub_folder+"features.npy", features)
-            np.save(sub_folder+"ids.npy", ids)
+                imgs = imgs.view(batch * m, c, M, N)
+                gt_mask = gt_mask.squeeze(0)
+                labels = labels.view(batch * m)
 
+                x, _ = self(imgs)
+
+                preds = torch.argmax(x, 1).data.cpu().numpy()
+
+                ## all input image have identical width and height
+                X_min = img_meta["window"][0][0].data.cpu().numpy()
+                X_max = img_meta["window"][1][0].data.cpu().numpy()
+                Y_min = img_meta["window"][2][0].data.cpu().numpy()
+                Y_max = img_meta["window"][3][0].data.cpu().numpy()
+
+                X = img_meta['shape'][0][0].data.cpu().numpy()
+                Y = img_meta['shape'][1][0].data.cpu().numpy()
+
+                ## extracting CAM explainability cues
+                img_cam = imgs[:, :, X_min:X_max, Y_min:Y_max]
+                x = self.cam_output(img_cam)
+                x = F.upsample(x, [X, Y], mode='bilinear', align_corners=False)
+
+                # resizing label to (batch , 1, 240, 320)
+                label_idx = labels.view(-1, 1, 1, 1).repeat((1, 1) + x.size()[-2:])
+
+                cams = torch.gather(x, 1, label_idx).squeeze()
+
+                normalizer = torch.amax(cams, (1, 2))
+                normalizer += (normalizer == 0) * 1  ## avoid dividing by zero
+                cams = cams / normalizer.view(-1, 1, 1)
+
+                ## thresholding cams
+                cams = (cams > 0.4) * labels.view(-1, 1, 1)
+
+                ## insterting
+                for current_index in range(cams.shape[0]):
+                    current_label = labels[current_index].data.cpu().numpy()
+                    if current_label > 0:
+                        current_cam = cams[current_index].data.cpu().numpy()
+                        current_gt_mask = gt_mask[current_index].data.cpu().numpy()
+                        current_pred_mask = np.zeros_like(current_gt_mask)
+
+                        label_im, nb_labels = ndimage.label(current_cam)
+                        if nb_labels > 0:
+                            ## catching the case of full zero cams
+                            ## extracting bboxes
+                            masks = [label_im == (i + 1) for i in range(nb_labels)]
+                            masks = np.asarray(masks).transpose(1, 2, 0)
+                            bboxes = extract_bboxes(masks)
+                            for i in range(nb_labels):
+                                current_bbox = bboxes[i, :]
+                                current_pred_mask[current_bbox[0]:current_bbox[2],
+                                current_bbox[1]:current_bbox[3]] = current_label
+
+                            hist = score_hist(hist, current_gt_mask, current_pred_mask, self.n_classes)
+
+                labels = labels.data.cpu().numpy()
+                for p_index in range(preds.shape[0]):
+                    conf_matrix[labels[p_index], preds[p_index]] += 1
+
+                print('Step: {}/{}\n'.format(index + 1, len(dataloader)))
+            mIoU = compute_mIOU(hist, self.n_classes)
+
+        return conf_matrix, mIoU
 
     def visualize_graph(self):
 
@@ -883,3 +639,790 @@ class VGG16_multiview(VGG16):
                         groups[1].append(m.bias)
 
         return groups
+
+
+class VGG16_multiview_plus(VGG16):
+
+    def __init__(self, n_classes, fc6_dilation=1):
+        super(VGG16_multiview_plus, self).__init__(n_classes, fc6_dilation=fc6_dilation)
+
+        self.fc8_triplet = nn.Conv2d(1024*3, self.n_classes, 1, bias=False)
+        self.fc8_left = nn.Conv2d(1024*3, self.n_classes, 1, bias=False)
+        self.fc8_centre = nn.Conv2d(1024*3, self.n_classes, 1, bias=False)
+        self.fc8_right = nn.Conv2d(1024*3, self.n_classes, 1, bias=False)
+
+        torch.nn.init.xavier_uniform_(self.fc8_triplet.weight)
+        torch.nn.init.xavier_uniform_(self.fc8_left.weight)
+        torch.nn.init.xavier_uniform_(self.fc8_centre.weight)
+        torch.nn.init.xavier_uniform_(self.fc8_right.weight)
+
+        self.from_scratch_layers.append(self.fc8_triplet)
+        self.from_scratch_layers.append(self.fc8_left)
+        self.from_scratch_layers.append(self.fc8_centre)
+        self.from_scratch_layers.append(self.fc8_right)
+        return
+
+    def cam_output(self, x):
+
+        x = self.feature_extractor(x)
+        x = x.view(x.shape[0] // 3,3*x.shape[1],x.shape[2],x.shape[3])
+
+        x_left = self.fc8_left(x) ## fc8 was set with bias=False and this is why applying the fc8 is like array multiplication as intructed in equation (1) of paper (1)
+        x_centre = self.fc8_centre(x) ## fc8 was set with bias=False and this is why applying the fc8 is like array multiplication as intructed in equation (1) of paper (1)
+        x_right = self.fc8_right(x) ## fc8 was set with bias=False and this is why applying the fc8 is like array multiplication as intructed in equation (1) of paper (1)
+        x = torch.cat((x_left, x_centre, x_right ), dim=0)
+        x = F.relu(x)
+        x = torch.sqrt(x) ## smoothed by square rooting to obtain a more uniform cam visualization
+        return x
+
+
+    def forward(self, x):
+
+        feat = self.feature_extractor(x)
+
+        x1 = feat
+        x1 = x1.view(x1.shape[0] // 3,3*x1.shape[1],x1.shape[2],x1.shape[3])
+        x1 = self.drop7(x1)
+        x1_left = self.fc8_left(x1)
+        x1_centre = self.fc8_centre(x1)
+        x1_right = self.fc8_right(x1)
+        x1 = torch.cat((x1_left, x1_centre, x1_right ), dim=0)
+        x1 = F.avg_pool2d(x1, kernel_size=(x1.size(2), x1.size(3)), padding=0)
+        x1 = x1.view(-1, self.n_classes)
+
+        x2 = self.drop7(feat)
+        x2 = x2.view(x2.shape[0] // 3,3*x2.shape[1],x2.shape[2],x2.shape[3])
+        x2 = self.fc8_triplet(x2)
+        x2 = F.avg_pool2d(x2, kernel_size=(x2.size(2), x2.size(3)), padding=0)
+        x2 = x2.view(-1, self.n_classes)
+
+        return x1, x2
+
+    def train_epoch(self, dataloader, optimizer, criterion, verbose=True):
+
+        train_loss = 0
+        train_accuracy = 0
+        self.train()
+
+        for index,data in enumerate(dataloader):
+
+
+            imgs = data[2]
+            labels = data[3]
+            triplet_label = data[4]
+
+            [batch,m,c,M,N] = imgs.size()
+
+            imgs = imgs.view(batch*m, c, M, N)
+            labels = labels.view(batch*m)
+
+
+            x, x_triplet =  self(imgs)
+
+            loss = criterion(x, labels)
+            loss_triplet = criterion(x_triplet, triplet_label)
+
+            loss = 2/3*loss + 1/3*loss_triplet
+
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+            ### adding batch loss into the overall loss
+            train_loss += loss.item()
+
+            preds = torch.argmax(x, 1)
+            ### adding batch loss into the overall loss
+            batch_accuracy = sum(preds == labels) / x.shape[0]
+            train_accuracy += batch_accuracy
+
+            if verbose:
+                ### Printing epoch results
+                print('Train Epoch: {}/{}\n'
+                      'Step: {}/{}\n'
+                      'Batch ~ Loss: {:.4f}\n'
+                      'Batch ~ Accuracy: {:.4f}\n'.format(self.epoch + 1, self.epochs,
+                                                          index + 1, len(dataloader),
+                                                          loss.data.cpu().numpy(),
+                                                          batch_accuracy.data.cpu().numpy()))
+            torch.cuda.empty_cache()
+
+        self.train_history["loss"].append(train_loss / (index + 1))
+        self.train_history["accuracy"].append(train_accuracy / (index + 1))
+
+        return
+
+    def val_epoch(self, dataloader,criterion, verbose=True):
+
+           val_loss = 0
+           val_accuracy = 0
+           self.eval()
+
+           conf_matrix = np.zeros((18,18))
+           with torch.no_grad():
+
+               for index, data in enumerate(dataloader):
+
+                   imgs = data[2]
+                   labels = data[3]
+
+                   [batch, m, c, M, N] = imgs.size()
+
+                   imgs = imgs.view(batch * m, c, M, N)
+                   labels = labels.view(batch * m)
+
+                   x, _ = self(imgs)
+                   loss = criterion(x, labels)
+
+                   ### adding batch loss into the overall loss
+                   val_loss += loss.item()
+
+                   preds = torch.argmax(x, 1)
+                   ### adding batch loss into the overall loss
+                   batch_accuracy = sum(preds == labels) / x.shape[0]
+                   val_accuracy += batch_accuracy
+
+                   preds = preds.data.cpu().numpy()
+                   labels = labels.data.cpu().numpy()
+
+                   for p_index in range(preds.shape[0]):
+                       conf_matrix[labels[p_index], preds[p_index]]+=1
+
+
+                   if verbose:
+                       ### Printing epoch results
+                       print('Val Epoch: {}/{}\n'
+                             'Step: {}/{}\n'
+                             'Batch ~ Loss: {:.4f}\n'
+                             'Batch ~ Accuracy: {:.4f}\n'.format(self.epoch + 1, self.epochs,
+                                                                 index + 1, len(dataloader),
+                                                                 loss.data.cpu().numpy(),
+                                                                 batch_accuracy.data.cpu().numpy()))
+                   torch.cuda.empty_cache()
+
+               self.val_history["loss"].append(val_loss / len(dataloader))
+               self.val_history["accuracy"].append(val_accuracy / len(dataloader))
+
+
+           return conf_matrix
+
+    def evaluate(self, dataloader):
+
+        self.eval()
+
+        conf_matrix = np.zeros((self.n_classes, self.n_classes))
+
+        hist = np.zeros((self.n_classes, self.n_classes))
+
+        with torch.no_grad():
+
+            for index, data in enumerate(dataloader):
+
+
+                img_meta = data[0][0]  # img_meta identical for all samples
+                gt_mask = data[1]
+                imgs = data[2]
+                labels = data[3]
+
+                [batch, m, c, M, N] = imgs.size()
+
+                imgs = imgs.view(batch * m, c, M, N)
+                gt_mask = gt_mask.squeeze(0)
+                labels = labels.view(batch * m)
+
+                x, _ = self(imgs)
+
+                preds = torch.argmax(x, 1).data.cpu().numpy()
+
+                ## all input image have identical width and height
+                X_min = img_meta["window"][0][0].data.cpu().numpy()
+                X_max = img_meta["window"][1][0].data.cpu().numpy()
+                Y_min = img_meta["window"][2][0].data.cpu().numpy()
+                Y_max = img_meta["window"][3][0].data.cpu().numpy()
+
+                X = img_meta['shape'][0][0].data.cpu().numpy()
+                Y = img_meta['shape'][1][0].data.cpu().numpy()
+
+                ## extracting CAM explainability cues
+                img_cam = imgs[:, :, X_min:X_max, Y_min:Y_max]
+                x = self.cam_output(img_cam)
+                x = F.upsample(x, [X, Y], mode='bilinear', align_corners=False)
+
+                # resizing label to (batch , 1, 240, 320)
+                label_idx = labels.view(-1, 1, 1, 1).repeat((1, 1) + x.size()[-2:])
+
+                cams = torch.gather(x, 1, label_idx).squeeze()
+
+                normalizer = torch.amax(cams, (1, 2))
+                normalizer += (normalizer == 0) * 1  ## avoid dividing by zero
+                cams = cams / normalizer.view(-1, 1, 1)
+
+                ## thresholding cams
+                cams = (cams > 0.4) * labels.view(-1, 1, 1)
+
+                ## insterting
+                for current_index in range(cams.shape[0]):
+                    current_label = labels[current_index].data.cpu().numpy()
+                    if current_label > 0:
+                        current_cam = cams[current_index].data.cpu().numpy()
+                        current_gt_mask = gt_mask[current_index].data.cpu().numpy()
+                        current_pred_mask = np.zeros_like(current_gt_mask)
+
+                        label_im, nb_labels = ndimage.label(current_cam)
+                        if nb_labels > 0:
+                            ## catching the case of full zero cams
+                            ## extracting bboxes
+                            masks = [label_im == (i + 1) for i in range(nb_labels)]
+                            masks = np.asarray(masks).transpose(1, 2, 0)
+                            bboxes = extract_bboxes(masks)
+                            for i in range(nb_labels):
+                                current_bbox = bboxes[i, :]
+                                current_pred_mask[current_bbox[0]:current_bbox[2],
+                                current_bbox[1]:current_bbox[3]] = current_label
+
+                            hist = score_hist(hist, current_gt_mask, current_pred_mask, self.n_classes)
+
+                labels = labels.data.cpu().numpy()
+                for p_index in range(preds.shape[0]):
+                    conf_matrix[labels[p_index], preds[p_index]] += 1
+
+                print('Step: {}/{}\n'.format(index + 1, len(dataloader)))
+            mIoU = compute_mIOU(hist, self.n_classes)
+
+        return conf_matrix, mIoU
+
+    def visualize_graph(self):
+
+        ## Plotting loss
+        plt.figure()
+        plt.xlabel("Epoch")
+        plt.ylabel("Loss")
+        plt.title("Loss Graph")
+
+        plt.plot(np.arange(len(self.train_history["loss"])), self.train_history["loss"], label="train")
+        plt.plot(np.arange(len(self.val_history["loss"])), self.val_history["loss"], label="val")
+
+        plt.legend()
+        plt.savefig(self.session_name+"loss.png")
+        plt.close()
+
+
+        ## Plotting accyracy
+        plt.figure()
+        plt.xlabel("Epoch")
+        plt.ylabel("Accuracy")
+        plt.title("Accuracy Graph")
+
+        plt.plot(np.arange(len(self.train_history["accuracy"])), self.train_history["accuracy"], label="train")
+        plt.plot(np.arange(len(self.val_history["accuracy"])), self.val_history["accuracy"], label="val")
+
+        plt.legend()
+        plt.savefig(self.session_name+"accuracy.png")
+        plt.close()
+
+
+
+    def get_parameter_groups(self):
+        groups = ([], [], [], [])
+
+        for m in self.modules():
+
+            if (isinstance(m, nn.Conv2d) or isinstance(m, nn.BatchNorm2d)):
+
+                if m.weight is not None and m.weight.requires_grad:
+                    if m in self.from_scratch_layers:
+                        groups[2].append(m.weight)
+                    else:
+                        groups[0].append(m.weight)
+
+                if m.bias is not None and m.bias.requires_grad:
+
+                    if m in self.from_scratch_layers:
+                        groups[3].append(m.bias)
+                    else:
+                        groups[1].append(m.bias)
+
+        return groups
+
+
+class VGG16_binary_aux(VGG16):
+
+    def __init__(self, n_classes, fc6_dilation=1):
+        super(VGG16_binary_aux, self).__init__(n_classes, fc6_dilation=fc6_dilation)
+
+        self.fc8_binary = nn.Conv2d(1024, 2, 1, bias=False)
+
+        torch.nn.init.xavier_uniform_(self.fc8_binary.weight)
+
+        self.from_scratch_layers.append(self.fc8_binary)
+
+        return
+
+    def forward(self, x):
+
+        feat = self.feature_extractor(x)
+
+        x1 = self.drop7(feat)
+        x1 = self.fc8(x1)
+        x1 = F.avg_pool2d(x1, kernel_size=(x1.size(2), x1.size(3)), padding=0)
+        x1 = x1.view(-1, self.n_classes)
+
+        x2 = self.drop7(feat)
+        x2 = self.fc8_binary(x2)
+        x2 = F.avg_pool2d(x2, kernel_size=(x2.size(2), x2.size(3)), padding=0)
+        x2 = x2.view(-1, 2)
+
+
+        return x1, x2
+
+
+    def train_epoch(self, dataloader, optimizer, criterion, criterion_binary,verbose=True):
+
+        train_loss = 0
+        train_accuracy = 0
+        self.train()
+
+        for index,data in enumerate(dataloader):
+
+            img = data[2]
+            label = data[3]
+            binary_label = (label!=0)*1
+            x, x_binary =  self(img)
+
+            loss = criterion(x, label)
+            loss_binary = criterion_binary(x_binary, binary_label)
+            loss = 2/3*loss + 1/3*loss_binary
+
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+            ### adding batch loss into the overall loss
+            train_loss += loss.item()
+
+            preds = torch.argmax(x, 1)
+            ### adding batch loss into the overall loss
+            batch_accuracy = sum(preds == label) / x.shape[0]
+            train_accuracy += batch_accuracy
+
+            if verbose:
+                ### Printing epoch results
+                print('Train Epoch: {}/{}\n'
+                      'Step: {}/{}\n'
+                      'Batch ~ Loss: {:.4f}\n'
+                      'Batch ~ Accuracy: {:.4f}\n'.format(self.epoch + 1, self.epochs,
+                                                          index + 1, len(dataloader),
+                                                          loss.data.cpu().numpy(),
+                                                          batch_accuracy.data.cpu().numpy()))
+            torch.cuda.empty_cache()
+
+        self.train_history["loss"].append(train_loss / (index + 1))
+        self.train_history["accuracy"].append(train_accuracy / (index + 1))
+
+        return
+
+    def val_epoch(self, dataloader,criterion, verbose=True):
+
+           val_loss = 0
+           val_accuracy = 0
+           self.eval()
+
+           conf_matrix = np.zeros((18,18))
+           with torch.no_grad():
+
+               for index, data in enumerate(dataloader):
+
+                   img = data[2]
+                   label = data[3]
+
+                   x,_ = self(img)
+                   loss =criterion(x, label)
+
+                   ### adding batch loss into the overall loss
+                   val_loss += loss.item()
+
+                   preds = torch.argmax(x, 1)
+                   ### adding batch loss into the overall loss
+                   batch_accuracy = sum(preds == label) / x.shape[0]
+                   val_accuracy += batch_accuracy
+
+                   preds = preds.data.cpu().numpy()
+                   labels = label.data.cpu().numpy()
+
+                   for p_index in range(preds.shape[0]):
+                       conf_matrix[labels[p_index], preds[p_index]]+=1
+
+
+                   if verbose:
+                       ### Printing epoch results
+                       print('Val Epoch: {}/{}\n'
+                             'Step: {}/{}\n'
+                             'Batch ~ Loss: {:.4f}\n'
+                             'Batch ~ Accuracy: {:.4f}\n'.format(self.epoch + 1, self.epochs,
+                                                                 index + 1, len(dataloader),
+                                                                 loss.data.cpu().numpy(),
+                                                                 batch_accuracy.data.cpu().numpy()))
+                   torch.cuda.empty_cache()
+
+               self.val_history["loss"].append(val_loss / len(dataloader))
+               self.val_history["accuracy"].append(val_accuracy / len(dataloader))
+
+
+           return conf_matrix
+
+
+    def evaluate(self,dataloader):
+
+
+        self.eval()
+
+        conf_matrix = np.zeros((self.n_classes, self.n_classes))
+
+        hist = np.zeros((self.n_classes, self.n_classes))
+
+        with torch.no_grad():
+
+
+
+            for index, data in enumerate(dataloader):
+
+
+
+                img_meta = data[0][0] # img_meta identical for all samples
+                gt_mask = data[1]
+                img = data[2]
+                label = data[3]
+                x, _ = self(img)
+
+                preds = torch.argmax(x, 1).data.cpu().numpy()
+
+
+                ## all input image have identical width and height
+                X_min = img_meta["window"][0][0].data.cpu().numpy()
+                X_max =  img_meta["window"][1][0].data.cpu().numpy()
+                Y_min = img_meta["window"][2][0].data.cpu().numpy()
+                Y_max =  img_meta["window"][3][0].data.cpu().numpy()
+
+                X = img_meta['shape'][0][0].data.cpu().numpy()
+                Y = img_meta['shape'][1][0].data.cpu().numpy()
+
+                ## extracting CAM explainability cues
+                img_cam = img[:,:,X_min:X_max,Y_min:Y_max]
+                x = self.cam_output(img_cam)
+                x = F.upsample(x, [X, Y], mode='bilinear', align_corners=False)
+
+                # resizing label to (batch , 1, 240, 320)
+                label_idx = label.view(-1, 1, 1, 1).repeat((1, 1) + x.size()[-2:])
+
+                cams = torch.gather(x, 1, label_idx).squeeze()
+
+                normalizer = torch.amax(cams, (1, 2))
+                normalizer += (normalizer == 0)*1 ## avoid dividing by zero
+                cams = cams / normalizer.view(-1,1,1)
+
+                ## thresholding cams
+                cams = (cams>0.4)*label.view(-1, 1, 1)
+
+                ## insterting
+                for current_index in range(cams.shape[0]):
+                    current_label = label[current_index].data.cpu().numpy()
+                    if current_label>0:
+                        current_cam = cams[current_index].data.cpu().numpy()
+                        current_gt_mask = gt_mask[current_index].data.cpu().numpy()
+                        current_pred_mask = np.zeros_like(current_gt_mask)
+
+                        label_im, nb_labels = ndimage.label(current_cam)
+                        if nb_labels > 0:
+                            ## catching the case of full zero cams
+                            ## extracting bboxes
+                            masks = [label_im==(i+1) for i in range(nb_labels)]
+                            masks = np.asarray(masks).transpose(1,2,0)
+                            bboxes = extract_bboxes(masks)
+                            for i in range(nb_labels):
+                                current_bbox = bboxes[i,:]
+                                current_pred_mask[current_bbox[0]:current_bbox[2],
+                                current_bbox[1]:current_bbox[3]] = current_label
+
+                            hist = score_hist(hist, current_gt_mask, current_pred_mask, self.n_classes)
+
+                labels = label.data.cpu().numpy()
+                for p_index in range(preds.shape[0]):
+                    conf_matrix[labels[p_index], preds[p_index]] += 1
+
+                print('Step: {}/{}\n'.format(index + 1, len(dataloader)))
+            mIoU = compute_mIOU(hist,self.n_classes)
+
+        return conf_matrix, mIoU
+
+class VGG16_binary_aux_perb(VGG16):
+
+    def __init__(self, n_classes, fc6_dilation=1):
+        super(VGG16_binary_aux_perb, self).__init__(n_classes, fc6_dilation=fc6_dilation)
+
+        self.fc8_binary = nn.Conv2d(1024, 2, 1, bias=False)
+
+        torch.nn.init.xavier_uniform_(self.fc8_binary.weight)
+
+        self.from_scratch_layers.append(self.fc8_binary)
+
+        return
+
+    def forward(self, x):
+
+        feat = self.feature_extractor(x)
+
+        x1 = self.drop7(feat)
+        x1 = self.fc8(x1)
+        x1 = F.avg_pool2d(x1, kernel_size=(x1.size(2), x1.size(3)), padding=0)
+        x1 = x1.view(-1, self.n_classes)
+
+        x2 = self.drop7(feat)
+        x2 = self.fc8_binary(x2)
+        x2 = F.avg_pool2d(x2, kernel_size=(x2.size(2), x2.size(3)), padding=0)
+        x2 = x2.view(-1, 2)
+
+
+        return x1, x2
+
+
+    def train_epoch(self, dataloader, optimizer, criterion, criterion_binary,verbose=True):
+
+        train_loss = 0
+        train_accuracy = 0
+        self.train()
+
+        for index,data in enumerate(dataloader):
+
+            img = data[2]
+            label = data[3]
+            binary_label = (label!=0)*1
+            x, x_binary =  self(img)
+
+
+            ## extracting cams
+            label_cam = label.clone()
+            label_cam[label_cam == 0] = torch.argmax(x, dim=1)[label_cam == 0]
+
+            x_cam = self.cam_output(img)
+            x_cam = F.upsample(x_cam, [img.shape[-1], img.shape[-2]], mode='bilinear', align_corners=False)
+
+            label_cam_idx = label_cam.view(-1, 1, 1, 1).repeat((1, 1) + x_cam.size()[-2:])
+            cams_perb = torch.gather(x_cam, 1, label_cam_idx ).squeeze(1)
+
+            perb_idx = torch.amax(cams_perb, dim=(1, 2))
+
+            perb_idx = perb_idx.view(-1, 1, 1, 1).repeat((1, 1) + x_cam.size()[-2:]).squeeze(1)
+
+            perb_idx = cams_perb > 0.2*perb_idx
+            perb_idx = perb_idx.unsqueeze(1)
+            perb_idx = perb_idx.repeat(1,3,1,1)
+
+            img[perb_idx] = torch.min(img) ## all images have identical min values
+
+
+            x_perb, x_binary_perb =  self(img)
+
+
+            loss = criterion(x, label)
+            loss_x_perb = criterion(x_perb, torch.zeros_like(label))
+
+            loss_binary = criterion_binary(x_binary, binary_label)
+            loss_binary_perb = criterion_binary(x_binary_perb, torch.zeros_like(binary_label))
+
+            loss = 2/6*(loss+loss_x_perb) + 1/6*(loss_binary+loss_binary_perb)
+
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+            ### adding batch loss into the overall loss
+            train_loss += loss.item()
+
+            preds = torch.argmax(x, 1)
+            ### adding batch loss into the overall loss
+            batch_accuracy = sum(preds == label) / x.shape[0]
+            train_accuracy += batch_accuracy
+
+            if verbose:
+                ### Printing epoch results
+                print('Train Epoch: {}/{}\n'
+                      'Step: {}/{}\n'
+                      'Batch ~ Loss: {:.4f}\n'
+                      'Batch ~ Accuracy: {:.4f}\n'.format(self.epoch + 1, self.epochs,
+                                                          index + 1, len(dataloader),
+                                                          loss.data.cpu().numpy(),
+                                                          batch_accuracy.data.cpu().numpy()))
+            torch.cuda.empty_cache()
+
+        self.train_history["loss"].append(train_loss / (index + 1))
+        self.train_history["accuracy"].append(train_accuracy / (index + 1))
+
+        return
+
+    def val_epoch(self, dataloader,criterion, verbose=True):
+
+           val_loss = 0
+           val_accuracy = 0
+           self.eval()
+
+           conf_matrix = np.zeros((18,18))
+           with torch.no_grad():
+
+               for index, data in enumerate(dataloader):
+
+                   img = data[2]
+                   label = data[3]
+
+                   x,_ = self(img)
+                   loss =criterion(x, label)
+
+                   ### adding batch loss into the overall loss
+                   val_loss += loss.item()
+
+                   preds = torch.argmax(x, 1)
+                   ### adding batch loss into the overall loss
+                   batch_accuracy = sum(preds == label) / x.shape[0]
+                   val_accuracy += batch_accuracy
+
+                   preds = preds.data.cpu().numpy()
+                   labels = label.data.cpu().numpy()
+
+                   for p_index in range(preds.shape[0]):
+                       conf_matrix[labels[p_index], preds[p_index]]+=1
+
+
+                   if verbose:
+                       ### Printing epoch results
+                       print('Val Epoch: {}/{}\n'
+                             'Step: {}/{}\n'
+                             'Batch ~ Loss: {:.4f}\n'
+                             'Batch ~ Accuracy: {:.4f}\n'.format(self.epoch + 1, self.epochs,
+                                                                 index + 1, len(dataloader),
+                                                                 loss.data.cpu().numpy(),
+                                                                 batch_accuracy.data.cpu().numpy()))
+                   torch.cuda.empty_cache()
+
+               self.val_history["loss"].append(val_loss / (index + 1))
+               self.val_history["accuracy"].append(val_accuracy / (index + 1))
+
+
+           return conf_matrix
+
+
+    def evaluate(self,dataloader):
+
+
+        self.eval()
+
+        conf_matrix = np.zeros((self.n_classes, self.n_classes))
+
+        hist = np.zeros((self.n_classes, self.n_classes))
+
+        with torch.no_grad():
+
+
+
+            for index, data in enumerate(dataloader):
+
+
+
+                img_meta = data[0][0] # img_meta identical for all samples
+                gt_mask = data[1]
+                img = data[2]
+                label = data[3]
+                x, _ = self(img)
+
+                preds = torch.argmax(x, 1).data.cpu().numpy()
+
+
+                ## all input image have identical width and height
+                X_min = img_meta["window"][0][0].data.cpu().numpy()
+                X_max =  img_meta["window"][1][0].data.cpu().numpy()
+                Y_min = img_meta["window"][2][0].data.cpu().numpy()
+                Y_max =  img_meta["window"][3][0].data.cpu().numpy()
+
+                X = img_meta['shape'][0][0].data.cpu().numpy()
+                Y = img_meta['shape'][1][0].data.cpu().numpy()
+
+                ## extracting CAM explainability cues
+                img_cam = img[:,:,X_min:X_max,Y_min:Y_max]
+                x = self.cam_output(img_cam)
+                x = F.upsample(x, [X, Y], mode='bilinear', align_corners=False)
+
+                # resizing label to (batch , 1, 240, 320)
+                label_idx = label.view(-1, 1, 1, 1).repeat((1, 1) + x.size()[-2:])
+
+                print("")
+                cams = torch.gather(x, 1, label_idx).squeeze(dim=1)
+
+
+                normalizer = torch.amax(cams, (1, 2))
+                normalizer += (normalizer == 0)*1 ## avoid dividing by zero
+                cams = cams / normalizer.view(-1,1,1)
+
+                img_orig = plt.imread(img_meta["path"][0])[95:]
+
+
+                ## plotting cam
+                # display_cam = cams[0].data.cpu().numpy()
+                # plt.imshow(np.uint8(img_orig * np.tile(display_cam[..., None], (1, 1, 3))))
+                # plt.axis("off")
+                # plt.savefig(str(index) + ".png", bbox_inches='tight')
+
+
+                # plt.imshow(display_cam)
+                # plt.axis("off")
+                # plt.savefig(str(index) + ".png", bbox_inches='tight')
+                ## thresholding cams
+                cams = (cams>0.4)*label.view(-1, 1, 1)
+
+
+                ## plotting cam on input
+                # display_cam = (cams>0.4)[0].data.cpu().numpy()
+                # plt.imshow(np.uint8(img_orig * np.tile(display_cam[..., None], (1, 1, 3))))
+                # plt.axis("off")
+                # plt.savefig(str(index) + ".png", bbox_inches='tight')
+
+                ####
+                # plt.imshow(plt.imread(img_meta["path"][0]))
+                _, ax = plt.subplots()
+                ax.imshow(plt.imread(img_meta["path"][0])[95:])
+#               ###
+
+                ## insterting
+                for current_index in range(cams.shape[0]):
+                    current_label = label[current_index].data.cpu().numpy()
+                    if current_label>0:
+                        current_cam = cams[current_index].data.cpu().numpy()
+                        current_gt_mask = gt_mask[current_index].data.cpu().numpy()
+                        current_pred_mask = np.zeros_like(current_gt_mask)
+
+                        label_im, nb_labels = ndimage.label(current_cam)
+                        if nb_labels > 0:
+                            ## catching the case of full zero cams
+                            ## extracting bboxes
+                            masks = [label_im==(i+1) for i in range(nb_labels)]
+                            masks = np.asarray(masks).transpose(1,2,0)
+                            bboxes = extract_bboxes(masks)
+                            for i in range(nb_labels):
+                                current_bbox = bboxes[i,:]
+                                current_pred_mask[current_bbox[0]:current_bbox[2],
+                                current_bbox[1]:current_bbox[3]] = current_label
+
+                                # ###
+                                # rect = patches.Rectangle((current_bbox[1], current_bbox[0]), current_bbox[2]-current_bbox[1], current_bbox[3]-current_bbox[0], linewidth=1, edgecolor='r',
+                                #                          facecolor='none')
+                                # ax.add_patch(rect)
+                                # ###
+
+
+                            hist = score_hist(hist, current_gt_mask, current_pred_mask, self.n_classes)
+
+                labels = label.data.cpu().numpy()
+                for p_index in range(preds.shape[0]):
+                    conf_matrix[labels[p_index], preds[p_index]] += 1
+
+                print('Step: {}/{}\n'.format(index + 1, len(dataloader)))
+            mIoU = compute_mIOU(hist,self.n_classes)
+
+        return conf_matrix, mIoU

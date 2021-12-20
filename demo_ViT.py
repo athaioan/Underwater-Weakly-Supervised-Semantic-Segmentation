@@ -1,0 +1,152 @@
+import numpy as np
+import torch
+from torch.utils.data import DataLoader
+from torchvision import transforms
+import importlib
+from types import SimpleNamespace
+from utils import *
+import torch.nn as nn
+import pandas as pd
+from models.modeling import VisionTransformer, CONFIGS
+# from networks import VGG16_binary_aux
+from focal_loss import FocalLoss
+
+### Setting arguments
+args = SimpleNamespace(epochs=10,
+                       batch_size=6,
+                       lr=0.5e-3,
+                       weight_decay=5e-3,
+                       input_dim=448,
+                       pretrained_weights="pretrained_ViT-B_16.pth",
+                       img_folder="MMT-Datasetv3/triplets/",
+                       train_set="train_new.txt",
+                       val_set="val_new.txt",
+                       test_set="test_new.txt",
+                       labels_dict="class_dict.npy",
+                       fl=True,
+                       step_update_lr=4,
+)
+
+# #### Stage 1
+args.session_name = "transformer_fl/"
+#
+
+loader_transform = transforms.Compose([
+        transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
+    ])
+
+
+## Constructing the training loader
+train_loader = MMTDataset_baseline(args.train_set, args.labels_dict, args.img_folder, args.input_dim, transform = loader_transform)
+train_loader = DataLoader(train_loader, batch_size=args.batch_size, shuffle=True)
+
+## Constructing the validation loader
+val_loader = MMTDataset_baseline(args.val_set, args.labels_dict, args.img_folder, args.input_dim, transform = loader_transform)
+val_loader = DataLoader(val_loader, batch_size=args.batch_size, shuffle=False)
+
+## Constructing the test loader
+test_loader = MMTDataset_baseline(args.test_set, args.labels_dict, args.img_folder, args.input_dim, transform = loader_transform)
+test_loader = DataLoader(test_loader, batch_size=args.batch_size, shuffle=False)
+
+## Initializing the model
+config = CONFIGS["ViT-B_16"]
+num_classes = 18
+model = VisionTransformer(config, args.input_dim, zero_head=True, num_classes=num_classes)
+
+model.epochs = args.epochs
+model.session_name = args.session_name
+model.load_pretrained(args.pretrained_weights)
+model.cuda()
+
+
+
+if not os.path.exists(model.session_name):
+    os.makedirs(model.session_name)
+
+# Prepare optimizer and scheduler
+optimizer = torch.optim.SGD(model.parameters(),
+                            lr=args.lr,
+                            momentum=0.9,
+                            weight_decay=args.weight_decay)
+
+if args.fl:
+    ## focal loss
+    criterion = FocalLoss()
+else:
+    ## frequency-based weighting
+    class_weight = 45117 / torch.tensor(
+        [30160, 2, 9757, 1004, 4, 205, 833, 4, 252, 21, 7, 1366, 1323, 83, 56, 26, 1, 13]).cuda()
+    criterion = nn.CrossEntropyLoss(weight=class_weight)
+
+
+# #
+# for current_epoch in range(model.epochs):
+#
+#     if current_epoch % args.step_update_lr == args.step_update_lr-1:
+#         for g in optimizer.param_groups:
+#             g['lr'] = g['lr']/3
+#
+#
+#     model.epoch = current_epoch
+#
+#     print("Training epoch...")
+#     model.train_epoch(train_loader, optimizer,criterion)
+#
+#     print("Validating epoch...")
+#     conf_matrix = model.val_epoch(val_loader,criterion)
+#     model.visualize_graph()
+#
+#     if model.val_history["loss"][-1] < model.min_val:
+#         print("Saving model...")
+#         model.min_val = model.val_history["loss"][-1]
+#
+#         torch.save(model.state_dict(), model.session_name+"stage_1.pth")
+#         df = pd.DataFrame(conf_matrix)
+#         filepath = args.session_name+'val_conf_matrix.xlsx'
+#         df.to_excel(filepath, index=False)
+#
+
+## Initializing the model
+## Initializing the model
+config = CONFIGS["ViT-B_16"]
+num_classes = 18
+model = VisionTransformer(config, args.input_dim, zero_head=True, num_classes=num_classes)
+
+model.epochs = args.epochs
+model.session_name = args.session_name
+model.load_pretrained(model.session_name+"stage_1.pth")
+model.cuda()
+
+#
+print("testing epoch...")
+model.epoch = 0
+model.epochs = 0
+
+conf_matrix_test, mIoU_test = model.evaluate(test_loader)
+metrics_test = compute_metrics(conf_matrix_test)
+#
+# metrics_test = np.hstack([metrics_test, mIoU_test[:, np.newaxis]])
+#
+# df = pd.DataFrame(metrics_test)
+# filepath = args.session_name + 'test_metrics.xlsx'
+# df.to_excel(filepath, index=False)
+#
+# df = pd.DataFrame(conf_matrix_test)
+# filepath = args.session_name + 'test_conf_matrix.xlsx'
+# df.to_excel(filepath, index=False)
+#
+#
+# conf_matrix_val, mIoU_val = model.evaluate(val_loader)
+# metrics_val = compute_metrics(conf_matrix_val)
+#
+# metrics_val = np.hstack([metrics_val, mIoU_val[:, np.newaxis]])
+#
+#
+# df = pd.DataFrame(metrics_val)
+# filepath = args.session_name + 'val_metrics.xlsx'
+# df.to_excel(filepath, index=False)
+#
+# df = pd.DataFrame(conf_matrix_val)
+# filepath = args.session_name + 'val_conf_matrix.xlsx'
+# df.to_excel(filepath, index=False)
+
